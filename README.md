@@ -44,8 +44,8 @@ app.py                       Streamlit dashboard (reads saved outputs only)
 dashboard_data.py            Loading, validation, KPI and filter logic for the dashboard
 scripts/run_workflow.py      Final workflow: split, train, tune, evaluate, save
 Notebooks/loan_default_analysis.ipynb   Data inspection, EDA, preliminary experiments
-Notebooks/testspark.py       Spark/Java installation smoke test
 tests/test_dashboard_data.py Unit tests for the dashboard data layer
+tests/test_workflow.py       Workflow validation and split integration tests
 requirements.txt
 data/raw/                    Place the dataset here (not included)
 outputs/model/loan_default_pipeline/    Saved Spark PipelineModel
@@ -54,7 +54,7 @@ outputs/graphs/              EDA and evaluation figures
 ```
 
 ## Methodology
-**Preprocessing.** The CSV is read with `inferSchema`. Missing values and duplicates were checked (none found in this sample). `LoanID` is excluded from model features. Imputation was therefore not needed; `handleInvalid="keep"` in the indexers, encoder and assembler guards against unseen categories or nulls at prediction time.
+**Input validation and preprocessing.** The CSV is read with `inferSchema` and validated before splitting. The workflow requires all 18 expected columns, numeric feature/target types, string identifiers/categories, no nulls, unique `LoanID` values, no duplicate rows, and binary `Default` values. Invalid input stops with a clear error; rows are never silently removed. `LoanID` is excluded from model features. Imputation was therefore not needed; `handleInvalid="keep"` in the indexers, encoder and assembler guards against unseen categories or nulls at prediction time.
 
 **EDA.** Class distribution; default rate by employment type, education, marital status and loan purpose; group means of numerical features by outcome; correlation of numerical features with `Default`. These are descriptive associations, not causal findings.
 
@@ -130,15 +130,15 @@ Commands work from any directory when you give the path to the project files; fr
 python scripts/run_workflow.py
 
 # 2. Launch the dashboard (works with the included outputs, no dataset needed)
-streamlit run app.py
+python -m streamlit run app.py
 
-# 3. Unit tests for the dashboard data layer
+# 3. Unit and integration tests
 python -m unittest discover -s tests
 ```
-Re-running the workflow overwrites files in `outputs/`. Results may differ slightly from those reported here if the Spark version or environment differs, and the metrics above should only be updated by re-running the workflow.
+Re-running the workflow overwrites files in `outputs/`; preserve or back up existing outputs first. Results may differ slightly from those reported here if the Spark version or environment differs, and the metrics above should only be updated by re-running the workflow. The project `.gitignore` excludes `.venv/`, Python caches, notebook checkpoints, and macOS metadata; do not commit the local virtual environment.
 
 ## Notebook
-`Notebooks/loan_default_analysis.ipynb` contains inspection, EDA and feature-engineering steps reused by the final workflow, followed by a section marked **preliminary experiments** (80/20 random split, no weights, 0.5 threshold; Logistic Regression recall 0.039, Random Forest recall 0.0). Those numbers are superseded by the final workflow above.
+`Notebooks/loan_default_analysis.ipynb` contains inspection, EDA and feature-engineering steps reused by the final workflow. Its 80/20 random split, unweighted models and 0.5 threshold are explicitly labelled **preliminary experiments** and must not be reported as final results. The final workflow uses a leakage-safe stratified 64:16:20 train/validation/test split, four weighted/unweighted model candidates, validation-only threshold tuning from 0.10 to 0.80, and final evaluation on the untouched test set. The selected model remains Weighted Logistic Regression with threshold `0.65`; the notebook's final-results note reads the generated metrics rather than duplicating a second training implementation.
 
 ## Limitations
 - 5,000-row sequential subset of a 255,347-row dataset; not a random sample, so results may not generalize.

@@ -30,6 +30,7 @@ from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
 from pyspark.ml.functions import vector_to_array
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col, lit, rand, row_number, when
+from pyspark.sql.types import NumericType, StringType
 from pyspark.sql.window import Window
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +52,62 @@ CATEGORICAL_FEATURES = [
     "Education", "EmploymentType", "MaritalStatus", "HasMortgage",
     "HasDependents", "LoanPurpose", "HasCoSigner",
 ]
+REQUIRED_COLUMNS = ["LoanID", *NUMERIC_FEATURES, *CATEGORICAL_FEATURES, "Default"]
+
+
+def validate_input_dataframe(df: DataFrame) -> None:
+    """Validate the input contract before any split or model fitting."""
+    missing_columns = [name for name in REQUIRED_COLUMNS if name not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Dataset is missing required columns: {', '.join(missing_columns)}")
+
+    invalid_types = []
+    for name in NUMERIC_FEATURES + ["Default"]:
+        if not isinstance(df.schema[name].dataType, NumericType):
+            invalid_types.append(f"{name} ({df.schema[name].dataType.simpleString()})")
+    for name in ["LoanID", *CATEGORICAL_FEATURES]:
+        if not isinstance(df.schema[name].dataType, StringType):
+            invalid_types.append(f"{name} ({df.schema[name].dataType.simpleString()})")
+    if invalid_types:
+        raise ValueError(
+            "Dataset has invalid column types; expected numeric features/Default and "
+            f"string identifiers/categories: {', '.join(invalid_types)}"
+        )
+
+    missing_counts = (
+        df.select([
+            col(name).isNull().cast("long").alias(name)
+            for name in REQUIRED_COLUMNS
+        ]).groupBy().sum().first().asDict()
+    )
+    missing = {
+        name: int(missing_counts.get(f"sum({name})") or 0)
+        for name in REQUIRED_COLUMNS
+        if int(missing_counts.get(f"sum({name})") or 0) > 0
+    }
+    if missing:
+        details = ", ".join(f"{name}={count}" for name, count in missing.items())
+        raise ValueError(f"Dataset contains missing values: {details}")
+
+    invalid_labels = [
+        row["Default"]
+        for row in df.select("Default").distinct().collect()
+        if row["Default"] not in (0, 1, 0.0, 1.0)
+    ]
+    if invalid_labels:
+        raise ValueError(f"Default must contain only 0 and 1; found {invalid_labels}")
+
+    duplicate_rows = df.count() - df.dropDuplicates().count()
+    if duplicate_rows:
+        raise ValueError(
+            f"Dataset contains {duplicate_rows} duplicate row(s); remove them before training."
+        )
+    duplicate_ids = df.count() - df.select("LoanID").distinct().count()
+    if duplicate_ids:
+        raise ValueError(
+            f"Dataset contains {duplicate_ids} duplicate LoanID row(s); "
+            "LoanID values must be unique."
+        )
 
 
 def stratified_split(df: DataFrame, seed: int = 42) -> tuple[DataFrame, DataFrame, DataFrame]:
@@ -195,6 +252,7 @@ def main() -> None:
     )
     spark.sparkContext.setLogLevel("ERROR")
     df = spark.read.option("header", True).option("inferSchema", True).csv(str(DATA_PATH))
+    validate_input_dataframe(df)
     train, validation, test = stratified_split(df)
     preprocessing_model = make_preprocessing_pipeline().fit(train)
     prepared_train = preprocessing_model.transform(train).cache()

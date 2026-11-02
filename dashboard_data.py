@@ -1,6 +1,7 @@
 """Pure-pandas helpers for the dashboard (no Streamlit import, so they are unit-testable)."""
 
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -15,8 +16,8 @@ RISK_ORDER = ["Low", "Medium", "High"]
 RISK_COLORS = {"Low": "#2E8B57", "Medium": "#E0A100", "High": "#C0392B"}
 RISK_BANDS = {"Low": "< 0.30", "Medium": "0.30 to < 0.60", "High": ">= 0.60"}
 REQUIRED_PREDICTION_COLUMNS = ["LoanID", "Default", "prediction", "default_probability", "risk_category"]
-REQUIRED_METRIC_KEYS = ["Selected model", "Threshold", "Precision", "Recall", "F1 Score",
-                        "ROC-AUC", "TN", "FP", "FN", "TP"]
+REQUIRED_METRIC_KEYS = ["Selected model", "Threshold", "Accuracy", "Precision", "Recall",
+                        "F1 Score", "ROC-AUC", "TN", "FP", "FN", "TP", "Test rows"]
 
 
 class DataError(Exception):
@@ -33,6 +34,20 @@ def load_metrics(path: Path = METRICS_PATH) -> dict:
     missing = [key for key in REQUIRED_METRIC_KEYS if key not in metrics]
     if missing:
         raise DataError(f"{path.name} is missing keys: {', '.join(missing)}")
+    if not isinstance(metrics["Selected model"], str) or not metrics["Selected model"].strip():
+        raise DataError(f"{path.name} has an invalid Selected model.")
+    for key in ("Threshold", "Accuracy", "Precision", "Recall", "F1 Score", "ROC-AUC"):
+        value = metrics[key]
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise DataError(f"{path.name} has a non-numeric {key}.")
+        if not 0 <= float(value) <= 1:
+            raise DataError(f"{path.name} has {key} outside the range 0 to 1.")
+    for key in ("TN", "FP", "FN", "TP", "Test rows"):
+        value = metrics[key]
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or int(value) != value:
+            raise DataError(f"{path.name} has an invalid {key}.")
+        if int(value) < 0:
+            raise DataError(f"{path.name} has a negative {key}.")
     return metrics
 
 
@@ -57,12 +72,25 @@ def load_predictions(path: Path = PREDICTIONS_PATH) -> pd.DataFrame:
         raise DataError("default_probability values must lie between 0 and 1.")
     if not set(df["Default"].unique()) <= {0, 1}:
         raise DataError("Default must be 0 or 1.")
+    if not set(df["prediction"].unique()) <= {0, 1}:
+        raise DataError("prediction must be 0 or 1.")
+    if df["LoanID"].isna().any() or (df["LoanID"].astype(str).str.strip() == "").any():
+        raise DataError("LoanID must not be missing or blank.")
+    if df["LoanID"].astype(str).duplicated().any():
+        raise DataError("LoanID values must be unique.")
     if not set(df["risk_category"].unique()) <= set(RISK_ORDER):
         raise DataError("risk_category must be Low, Medium or High.")
     df["Default"] = df["Default"].astype(int)
     df["prediction"] = df["prediction"].astype(int)
     df["LoanID"] = df["LoanID"].astype(str)
     df["risk_category"] = pd.Categorical(df["risk_category"], categories=RISK_ORDER, ordered=True)
+    expected_risk = pd.cut(
+        df["default_probability"],
+        [-1, 0.30 - 1e-12, 0.60 - 1e-12, 2],
+        labels=RISK_ORDER,
+    )
+    if not (expected_risk.astype(str) == df["risk_category"].astype(str)).all():
+        raise DataError("risk_category does not match the configured score bands.")
     df["Actual"] = df["Default"].map({0: "No default", 1: "Default"})
     df["Predicted"] = df["prediction"].map({0: "No default", 1: "Default"})
     return df
@@ -74,10 +102,19 @@ def load_comparison(path: Path = COMPARISON_PATH):
         return None
     try:
         df = pd.read_csv(path)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise DataError(f"{path.name} could not be read: {exc}") from exc
     needed = ["Model", "Threshold", "Precision", "Recall", "F1 Score", "ROC-AUC"]
-    return df[needed] if all(c in df.columns for c in needed) else None
+    missing = [column for column in needed if column not in df.columns]
+    if missing:
+        raise DataError(f"{path.name} is missing columns: {', '.join(missing)}")
+    if df.empty or df["Model"].isna().any() or (df["Model"].astype(str).str.strip() == "").any():
+        raise DataError(f"{path.name} contains no valid model rows.")
+    for column in needed[1:]:
+        values = pd.to_numeric(df[column], errors="coerce")
+        if values.isna().any() or (~values.between(0, 1)).any():
+            raise DataError(f"{path.name} contains invalid values in {column}.")
+    return df[needed]
 
 
 def compute_kpis(predictions: pd.DataFrame, metrics: dict) -> dict:
@@ -99,10 +136,58 @@ def confusion_from_predictions(predictions: pd.DataFrame) -> dict:
             "FN": int(((a == 1) & (p == 0)).sum()), "TP": int(((a == 1) & (p == 1)).sum())}
 
 
-def metrics_consistent(predictions: pd.DataFrame, metrics: dict) -> bool:
-    """True when the saved metrics' confusion matrix matches the saved predictions."""
+def classification_metrics(predictions: pd.DataFrame) -> dict:
+    """Recalculate classification metrics from labels, predictions and scores."""
     cm = confusion_from_predictions(predictions)
-    return all(cm[k] == int(metrics[k]) for k in cm)
+    tn, fp, fn, tp = (cm[key] for key in ("TN", "FP", "FN", "TP"))
+    total = tn + fp + fn + tp
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "Accuracy": (tp + tn) / total if total else 0.0,
+        "Precision": precision,
+        "Recall": recall,
+        "F1 Score": f1,
+        "ROC-AUC": roc_auc_from_predictions(predictions),
+        **cm,
+    }
+
+
+def roc_auc_from_predictions(predictions: pd.DataFrame) -> float:
+    """Calculate ROC-AUC from continuous default_probability scores."""
+    labels = predictions["Default"]
+    if labels.nunique() != 2:
+        raise DataError("ROC-AUC requires both default classes in the predictions.")
+    positive = labels == 1
+    negative = labels == 0
+    ranks = predictions["default_probability"].rank(method="average")
+    positive_count = int(positive.sum())
+    negative_count = int(negative.sum())
+    rank_sum = float(ranks[positive].sum())
+    return (rank_sum - positive_count * (positive_count + 1) / 2) / (
+        positive_count * negative_count
+    )
+
+
+def metrics_consistent(predictions: pd.DataFrame, metrics: dict) -> bool:
+    """True when saved metrics agree with the complete prediction file."""
+    try:
+        calculated = classification_metrics(predictions)
+    except DataError:
+        return False
+    if any(key not in metrics for key in REQUIRED_METRIC_KEYS):
+        return False
+    if int(metrics["Test rows"]) != len(predictions):
+        return False
+    threshold = float(metrics["Threshold"])
+    expected = (predictions["default_probability"] >= threshold).astype(int)
+    if not (expected == predictions["prediction"]).all():
+        return False
+    for key, value in calculated.items():
+        if key in metrics and not math.isclose(float(metrics[key]), float(value), rel_tol=1e-9, abs_tol=1e-9):
+            return False
+    return True
 
 
 def risk_summary(predictions: pd.DataFrame) -> pd.DataFrame:

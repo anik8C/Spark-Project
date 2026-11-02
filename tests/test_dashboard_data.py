@@ -24,6 +24,11 @@ class SavedOutputTests(unittest.TestCase):
     def test_confusion_matches_saved_metrics(self):
         self.assertTrue(dd.metrics_consistent(self.pred, self.metrics))
 
+    def test_all_saved_metrics_match_predictions(self):
+        calculated = dd.classification_metrics(self.pred)
+        for key, value in calculated.items():
+            self.assertAlmostEqual(float(self.metrics[key]), float(value), places=9)
+
     def test_prediction_matches_threshold(self):
         expected = (self.pred["default_probability"] >= self.metrics["Threshold"]).astype(int)
         self.assertTrue((expected == self.pred["prediction"]).all())
@@ -53,6 +58,11 @@ class SavedOutputTests(unittest.TestCase):
         csv = dd.export_frame(dd.filter_borrowers(self.pred)).to_csv(index=False)
         self.assertEqual(len(pd.read_csv(__import__("io").StringIO(csv))), len(self.pred))
 
+    def test_metric_mismatch_is_rejected(self):
+        metrics = dict(self.metrics)
+        metrics["F1 Score"] = 0.0
+        self.assertFalse(dd.metrics_consistent(self.pred, metrics))
+
 
 class InvalidInputTests(unittest.TestCase):
     def test_missing_file(self):
@@ -68,6 +78,19 @@ class InvalidInputTests(unittest.TestCase):
             bad.write_text("LoanID,Default,prediction,default_probability,risk_category\nA,0,0,1.5,Low\n")
             with self.assertRaises(dd.DataError):
                 dd.load_predictions(bad)
+            bad.write_text("LoanID,Default,prediction,default_probability,risk_category\nA,0,2,0.5,Low\n")
+            with self.assertRaises(dd.DataError):
+                dd.load_predictions(bad)
+
+    def test_duplicate_loan_ids_are_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "p.csv"
+            path.write_text(
+                "LoanID,Default,prediction,default_probability,risk_category\n"
+                "A,0,0,0.2,Low\nA,0,0,0.2,Low\n"
+            )
+            with self.assertRaisesRegex(dd.DataError, "LoanID values must be unique"):
+                dd.load_predictions(path)
 
     def test_bad_metrics_json(self):
         with tempfile.TemporaryDirectory() as d:
@@ -78,6 +101,13 @@ class InvalidInputTests(unittest.TestCase):
             m.write_text(json.dumps({"Precision": 1}))
             with self.assertRaises(dd.DataError):
                 dd.load_metrics(m)
+
+    def test_bad_comparison_csv(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "comparison.csv"
+            path.write_text("Model,Threshold\nLogistic Regression,0.5\n")
+            with self.assertRaisesRegex(dd.DataError, "missing columns"):
+                dd.load_comparison(path)
 
 
 if __name__ == "__main__":
