@@ -1,0 +1,2 @@
+Model,Threshold,Accuracy,Precision,Recall,F1 Score,ROC-AUC,TN,FP,FN,TP,Training rows,Validation rows,Test rows,Selected model
+Logistic Regression (weighted),0.65,0.8181818181818182,0.3072289156626506,0.4322033898305085,0.35915492957746475,0.7632781158224105,768,115,67,51,3999,800,1001,Logistic Regression (weighted)

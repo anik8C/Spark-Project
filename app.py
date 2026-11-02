@@ -1,0 +1,214 @@
+"""Loan Default Risk Analytics - Streamlit dashboard.
+
+Reads only the saved workflow outputs (no Spark, no retraining). Run from any directory:
+    streamlit run app.py
+"""
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+import dashboard_data as dd
+
+st.set_page_config(page_title="Loan Default Risk Analytics", layout="wide")
+
+NEUTRAL = "#475569"
+ACCENT = "#1F4E79"
+CSS = """
+<style>
+.block-container {padding-top: 2rem; padding-bottom: 2rem; max-width: 1200px;}
+h1 {font-size: 1.9rem !important; font-weight: 650 !important; margin-bottom: 0.2rem;}
+h3 {font-size: 1.1rem !important; font-weight: 600 !important; margin-top: 1.6rem;}
+.subtle {color: #64748b; font-size: 0.92rem; margin-bottom: 0.6rem;}
+.pill {display:inline-block; padding: 2px 10px; margin-right: 8px; border-radius: 999px;
+       background:#eef2f7; color:#1f2937; font-size:0.82rem; font-weight:500;}
+.kpi {border:1px solid #e2e8f0; border-radius:10px; padding:12px 14px; background:#ffffff;}
+.kpi .label {font-size:0.76rem; color:#64748b; text-transform:uppercase; letter-spacing:.04em;}
+.kpi .value {font-size:1.55rem; font-weight:650; color:#0f172a; line-height:1.25;}
+.kpi .note {font-size:0.74rem; color:#94a3b8;}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_all():
+    """Cached: files are read once per session, not on every rerun."""
+    metrics = dd.load_metrics()
+    predictions = dd.load_predictions()
+    comparison = dd.load_comparison()
+    return metrics, predictions, comparison
+
+
+def kpi(column, label, value, note=""):
+    column.markdown(
+        f'<div class="kpi"><div class="label">{label}</div><div class="value">{value}</div>'
+        f'<div class="note">{note}&nbsp;</div></div>', unsafe_allow_html=True)
+
+
+def risk_color_scale():
+    return alt.Scale(domain=dd.RISK_ORDER, range=[dd.RISK_COLORS[r] for r in dd.RISK_ORDER])
+
+
+try:
+    metrics, predictions, comparison = load_all()
+except dd.DataError as error:
+    st.title("Loan Default Risk Analytics")
+    st.error(f"Dashboard data unavailable. {error}")
+    st.info("Generate the outputs first by running `python scripts/run_workflow.py` "
+            "(requires the dataset at `data/raw/Loan_default .csv`; see README).")
+    st.stop()
+
+model_name = str(metrics["Selected model"]).replace(" (weighted)", "").replace("Logistic", "Weighted Logistic")
+threshold = float(metrics["Threshold"])
+kpis = dd.compute_kpis(predictions, metrics)
+
+# ---------------------------------------------------------------- Header
+st.title("Loan Default Risk Analytics")
+st.markdown('<div class="subtle">Spark ML classification of loan default risk on a 5,000-record sequential '
+            'sample, evaluated on a held-out test set.</div>', unsafe_allow_html=True)
+st.markdown(f'<span class="pill">Model: {model_name}</span>'
+            f'<span class="pill">Threshold: {threshold:.2f}</span>', unsafe_allow_html=True)
+
+if not dd.metrics_consistent(predictions, metrics):
+    st.warning("The saved metrics and borrower predictions do not agree. "
+               "Re-run the workflow so both are regenerated together.")
+
+# ---------------------------------------------------------------- KPIs
+st.markdown("### Key indicators (held-out test set)")
+cols = st.columns(6)
+kpi(cols[0], "Borrowers evaluated", f"{kpis['borrowers']:,}", "test set")
+kpi(cols[1], "Actual default rate", f"{kpis['actual_default_rate']:.1%}", "true labels")
+kpi(cols[2], "Predicted default rate", f"{kpis['predicted_default_rate']:.1%}", f"score &ge; {threshold:.2f}")
+kpi(cols[3], "Precision", f"{kpis['precision']:.3f}", "of flagged, truly default")
+kpi(cols[4], "Recall", f"{kpis['recall']:.3f}", "of defaults, caught")
+kpi(cols[5], "ROC-AUC", f"{kpis['roc_auc']:.3f}", "ranking quality")
+
+# ---------------------------------------------------------------- Default analysis
+st.markdown("### Default analysis")
+left, mid, right = st.columns(3)
+
+counts = pd.DataFrame({
+    "Group": ["Actual", "Predicted"],
+    "Defaults": [int(predictions["Default"].sum()), int(predictions["prediction"].sum())],
+})
+chart = alt.Chart(counts).mark_bar(size=48).encode(
+    x=alt.X("Group:N", title=None, sort=["Actual", "Predicted"], axis=alt.Axis(labelAngle=0)),
+    y=alt.Y("Defaults:Q", title="Borrowers"),
+    color=alt.Color("Group:N", legend=None,
+                    scale=alt.Scale(domain=["Actual", "Predicted"], range=[NEUTRAL, ACCENT])),
+    tooltip=["Group", "Defaults"],
+)
+labels = chart.mark_text(dy=-8, fontSize=13).encode(text="Defaults:Q")
+left.markdown("**Actual vs predicted defaults**")
+left.altair_chart((chart + labels).properties(height=260), use_container_width=True)
+
+summary = dd.risk_summary(predictions)
+dist = alt.Chart(summary).mark_bar(size=48).encode(
+    x=alt.X("risk_category:N", title=None, sort=dd.RISK_ORDER, axis=alt.Axis(labelAngle=0)),
+    y=alt.Y("borrowers:Q", title="Borrowers"),
+    color=alt.Color("risk_category:N", legend=None, scale=risk_color_scale()),
+    tooltip=[alt.Tooltip("risk_category:N", title="Risk"), alt.Tooltip("borrowers:Q", title="Borrowers"),
+             alt.Tooltip("share:Q", title="Share", format=".1%")],
+)
+mid.markdown("**Borrowers by risk category**")
+mid.altair_chart((dist + dist.mark_text(dy=-8, fontSize=13).encode(text="borrowers:Q"))
+                 .properties(height=260), use_container_width=True)
+
+rate = alt.Chart(summary).mark_bar(size=48).encode(
+    x=alt.X("risk_category:N", title=None, sort=dd.RISK_ORDER, axis=alt.Axis(labelAngle=0)),
+    y=alt.Y("actual_default_rate:Q", title="Actual default rate", axis=alt.Axis(format="%")),
+    color=alt.Color("risk_category:N", legend=None, scale=risk_color_scale()),
+    tooltip=[alt.Tooltip("risk_category:N", title="Risk"),
+             alt.Tooltip("actual_default_rate:Q", title="Actual default rate", format=".1%"),
+             alt.Tooltip("borrowers:Q", title="Borrowers")],
+)
+right.markdown("**Actual default rate by risk category**")
+right.altair_chart((rate + rate.mark_text(dy=-8, fontSize=13).encode(text=alt.Text("actual_default_rate:Q", format=".1%")))
+                   .properties(height=260), use_container_width=True)
+
+st.caption(
+    "Risk bands (illustrative, not a lending policy): Low < 0.30, Medium 0.30 to < 0.60, High \u2265 0.60. "
+    f"The High band starts below the {threshold:.2f} decision threshold, so some High-risk borrowers are "
+    "not predicted as defaults. Class weighting inflates the scores, so they rank risk but are not calibrated "
+    "probabilities; compare each band's actual default rate instead.")
+
+# ---------------------------------------------------------------- Model performance
+st.markdown("### Model performance (final test set)")
+perf_left, perf_right = st.columns([1, 1.4])
+
+cm = dd.confusion_from_predictions(predictions)
+cm_df = pd.DataFrame([
+    {"Actual": "Actual default", "Predicted": "Predicted no default", "Count": cm["FN"]},
+    {"Actual": "Actual default", "Predicted": "Predicted default", "Count": cm["TP"]},
+    {"Actual": "Actual no default", "Predicted": "Predicted no default", "Count": cm["TN"]},
+    {"Actual": "Actual no default", "Predicted": "Predicted default", "Count": cm["FP"]},
+])
+heat = alt.Chart(cm_df).mark_rect(stroke="white").encode(
+    x=alt.X("Predicted:N", title=None, sort=["Predicted no default", "Predicted default"],
+            axis=alt.Axis(labelAngle=0, orient="top")),
+    y=alt.Y("Actual:N", title=None, sort=["Actual no default", "Actual default"]),
+    color=alt.Color("Count:Q", legend=None, scale=alt.Scale(range=["#eef3f8", ACCENT])),
+)
+heat_text = alt.Chart(cm_df).mark_text(fontSize=20, fontWeight="bold").encode(
+    x=alt.X("Predicted:N", sort=["Predicted no default", "Predicted default"]),
+    y=alt.Y("Actual:N", sort=["Actual no default", "Actual default"]),
+    text="Count:Q",
+    color=alt.condition(alt.datum.Count > 300, alt.value("white"), alt.value("#0f172a")),
+)
+perf_left.markdown("**Confusion matrix**")
+perf_left.altair_chart((heat + heat_text).properties(height=240), use_container_width=True)
+
+with perf_right:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Precision", f"{metrics['Precision']:.3f}")
+    m2.metric("Recall", f"{metrics['Recall']:.3f}")
+    m3.metric("F1-score", f"{metrics['F1 Score']:.3f}")
+    m4.metric("ROC-AUC", f"{metrics['ROC-AUC']:.3f}")
+    st.markdown(
+        f"The model caught **{cm['TP']}** of {cm['TP'] + cm['FN']} actual defaults and missed **{cm['FN']}**. "
+        f"It also flagged **{cm['FP']}** borrowers who did not default. "
+        "Detection improved over the unweighted baselines, but precision is low, so this is a screening "
+        "prototype rather than a production credit decision tool.")
+
+if comparison is not None:
+    with st.expander("Why Weighted Logistic Regression? Validation comparison (not test results)"):
+        shown = comparison.sort_values("F1 Score", ascending=False).reset_index(drop=True)
+        st.dataframe(
+            shown.style.format({c: "{:.3f}" for c in ["Precision", "Recall", "F1 Score", "ROC-AUC"]}
+                               | {"Threshold": "{:.2f}"}),
+            use_container_width=True, hide_index=True)
+        st.caption("Each model's threshold was tuned on the 800-record validation set; the model with the "
+                   "best validation F1 was selected. Test metrics above come from a separate, untouched set.")
+
+# ---------------------------------------------------------------- Borrower explorer
+st.markdown("### Borrower risk explorer")
+f1, f2, f3 = st.columns([2, 2, 2])
+loan_query = f1.text_input("Loan ID", placeholder="Search by Loan ID (partial match)")
+risk_filter = f2.multiselect("Risk category", dd.RISK_ORDER, default=dd.RISK_ORDER)
+status_filter = f3.selectbox("Show", ["All", "Predicted defaults", "Actual defaults", "Actual non-defaults"])
+
+filtered = dd.filter_borrowers(predictions, loan_query, risk_filter, status_filter)
+table = dd.export_frame(filtered)
+
+head_left, head_right = st.columns([3, 1])
+head_left.caption(f"{len(table):,} of {len(predictions):,} borrowers shown, highest default score first. "
+                  "Default score is the model output (uncalibrated).")
+head_right.download_button(
+    "Download CSV", data=dd.export_frame(filtered).to_csv(index=False).encode("utf-8"),
+    file_name="borrower_predictions_filtered.csv", mime="text/csv",
+    disabled=table.empty, use_container_width=True)
+
+if table.empty:
+    st.info("No borrowers match the current filters.")
+else:
+    def color_risk(value):
+        color = dd.RISK_COLORS.get(value, "#000000")
+        return f"color: {color}; font-weight: 600"
+
+    st.dataframe(
+        table.head(500).style.map(color_risk, subset=["Risk category"])
+        .format({"Default score": "{:.3f}"}),
+        use_container_width=True, hide_index=True, height=360)
+    if len(table) > 500:
+        st.caption("Table shows the first 500 rows; the CSV download contains all filtered rows.")

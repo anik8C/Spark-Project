@@ -1,0 +1,17 @@
+{
+  "Model": "Logistic Regression (weighted)",
+  "Threshold": 0.65,
+  "Accuracy": 0.8181818181818182,
+  "Precision": 0.3072289156626506,
+  "Recall": 0.4322033898305085,
+  "F1 Score": 0.35915492957746475,
+  "ROC-AUC": 0.7632781158224105,
+  "TN": 768,
+  "FP": 115,
+  "FN": 67,
+  "TP": 51,
+  "Training rows": 3999,
+  "Validation rows": 800,
+  "Test rows": 1001,
+  "Selected model": "Logistic Regression (weighted)"
+}
